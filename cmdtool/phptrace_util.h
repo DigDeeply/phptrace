@@ -10,6 +10,8 @@
 
 #include "sys_trace.h"
 
+#include "uthash.h"
+
 #include <stdio.h>
 #include <stdarg.h>
 #include <errno.h>
@@ -22,10 +24,24 @@
 # include <stdint.h>
 #endif
 
+#define PHPTRACE_NAME "phptrace"
+#define PHPTRACE_VERSION "0.2.3 stable"
+#define PHPTRACE_DEVELOPER "360 infra webcore team"
+
 #define MAX_TEMP_LENGTH 100
 #define MAX_PRINT_LENGTH 600
 
 #define RECORD_STRING_LENGTH  (4 * 1024)
+
+#define DEFAULT_TOP_N       20
+#define DEFAULT_MAX_LEVEL   2048
+
+#define OPT_FLAG_STATUS         0x0001                              /* flag of status */
+#define OPT_FLAG_CLEANUP        0x0002                              /* flag of cleanup */
+#define OPT_FLAG_COUNT          0x0004                              /* flag of count */
+
+#define OUTPUT_FLAG_WRITE       0x0001                              /* flag of write */
+#define OUTPUT_FLAG_JSON        0x0002                              /* flag of json */
 
 #define OPEN_DATA_WAIT_INTERVAL 100                                 /* ms */
 #define MAX_OPEN_DATA_WAIT_INTERVAL (OPEN_DATA_WAIT_INTERVAL * 16)  /* ms */
@@ -39,6 +55,7 @@
 #define phptrace_mem_read_64b(num, mem)     \
      do { (num) = *((int64_t *)(mem)); } while(0);
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
+#define MAX(x, y) ((x) > (y) ? (x) : (y))
 
 /* stack */
 #define valid_ptr(p) ((p) && 0 == ((p) & (sizeof(long) - 1)))
@@ -52,21 +69,40 @@
 #define MAX_RETRY 3
 
 enum {
-    PHPTRACE_ERROR = -1,
-    PHPTRACE_OK = 0,
-    PHPTRACE_AGAIN,
-    PHPTRACE_IGNORE
+    ERR = 1,
+    ERR_INVALID_PARAM,
+    ERR_STACK,
+    ERR_CTRL,
+    ERR_TRACE,
+    ERR_COUNT,
 };
 
 enum {
-    STATE_START = 0,
-    STATE_OPEN,
+    STATE_OPEN = 0,
     STATE_HEADER,
     STATE_RECORD,
     STATE_TAILER,
-    STATE_ERROR
+    STATE_END
 };
-static volatile int interrupted;        /* flag of interrupt (ctrl + c) */
+
+typedef struct record_count_s {
+    sds function_name;
+
+    uint64_t cost_time;                 /* inclusive cost time of function */
+    uint64_t cpu_time;                  /* inclusive cpu time of function */
+    int64_t memory_usage;
+    int64_t memory_peak_usage;
+    int32_t calls;
+
+    UT_hash_handle hh;
+}record_count_t;
+
+typedef struct count_dimension_s {
+    int (*cmp) (record_count_t *, record_count_t *);
+    const char* title;
+    const char* sortby;
+} count_dimension_t;
+
 
 /* stack address info */
 typedef struct address_info_s {
@@ -87,78 +123,94 @@ typedef struct address_info_s {
     long opline_ln_offset;
 } address_info_t;
 
-typedef struct phptrace_context_s {
-    int tracer_pid;                     /* pid of cmdtool */
-    uint64_t start_time;                /* start time of cmdtool */
+typedef struct phptrace_context_s phptrace_context_t;
 
-    char *progname;
-    FILE *log;                          /* output stream */
-    int log_level;                      /* log level */
+typedef sds (*phptrace_record_transform_t)(phptrace_context_t *ctx, phptrace_file_record_t *r);
+
+struct phptrace_context_s {
+    int32_t php_pid;                                    /* pid of the -p option, default -1 */
+    uint64_t start_time;                                /* start time of cmdtool */
+
+    FILE *log;                                          /* log output stream */
     sds mmap_filename;
-    int php_pid;                        /* pid of the -p option */
+    int32_t rotate_cnt;                                 /* count of rotate file */
 
-    int trace_flag;                     /* flag of trace data, default 0 */
-    int opt_c_flag;                     /* flag of cmdtool option -c, default 0 */
-    int opt_s_flag;                     /* flag of cmdtool option -s(stack), default 0 */
-    int opt_p_flag;                     /* flag of cmdtool option -p(pid), default 0 */
+    sds in_filename;                                    /* input filename */
+    FILE *out_fp;                                       /* output stream */
+    sds out_filename;                                   /* output filename */
 
-    int max_print_len;                  /* max length to print string, default is MAX_PRINT_LENGTH */
+    int32_t trace_flag;                                 /* flag of trace data, default 0 */
+    int32_t opt_flag;                                   /* flag of cmdtool option, -s -p -c --cleanup */
+    int32_t output_flag;                                /* flag of cmdtool output option, may be -w or -o */
+
+    int32_t max_print_len;                              /* max length to print32_t string, default is MAX_PRINT_LENGTH */
+
+    int32_t top_n;                                      /* top number to count, default is DEFAULT_TOP_N */
+    record_count_t *record_count;                       /* record count structure */
+    int32_t record_num;
+    int32_t sortby_idx;
+    int32_t exclusive_flag;                             /* flag of count exclusive time, default 0 */
+
+    int32_t max_level;
+    int64_t *sub_cost_time;                             /* count the time of sub calls' cost time when exclusive mode */
+    int64_t *sub_cpu_time;                              /* count the time of sub calls' cpu time when exclusive mode */
+    int64_t max_function;
 
     phptrace_file_t file;
     phptrace_segment_t seg;
     phptrace_ctrl_t ctrl;
 
+    phptrace_record_transform_t record_transform;     /* transform,  a function point32_ter */
+
     /* stack only */
-    int php_version;
-    int stack_deep;
-    int retry;
+    int32_t php_version;
+    int32_t stack_deep;
+    int32_t retry;
     address_info_t addr_info;
-
-}phptrace_context_t;
-
-enum {
-    ERR_OK = 0,
-    ERR_OPEN_CTRL,
-    ERR_STATE,
-    ERR_SEQ,
-    ERR_MALLOC,
-    ERR_READ,
-    ERR_SIG,
-    ERR_END
 };
 
 long hexstring2long(const char*s, size_t len);
 unsigned int string2uint(const char *str);
 
-void verror_msg(phptrace_context_t *ctx, int err_no, const char *fmt, va_list p);
-void error_msg(phptrace_context_t *ctx, int err_no, const char *fmt, ...);
+void verror_msg(phptrace_context_t *ctx, int err_code, const char *fmt, va_list p);
+void error_msg(phptrace_context_t *ctx, int err_code, const char *fmt, ...);
 void die(phptrace_context_t *ctx, int exit_code);
-void error_msg_and_die(phptrace_context_t *ctx, const char *fmt, ...);
-void show_err_msg();
 
-void phptrace_context_init(phptrace_context_t *ctx);
-void trace_start_ctrl(phptrace_context_t *ctx);
-void process_opt_c(phptrace_context_t *ctx);
-
-int open_mmap(phptrace_context_t *ctx);
-void interrupt(int sig);
 void usage();
+void phptrace_context_init(phptrace_context_t *ctx);
+
+void process_opt_e(phptrace_context_t *ctx);
 
 /* print utils */
 sds sdscatrepr_noquto(sds s, const char *p, size_t len);
 sds print_indent_str(sds s, char* str, int32_t size);
 sds print_time(sds s, uint64_t t);
-void print_record(phptrace_context_t *ctx, phptrace_file_record_t *r);
+
+sds standard_transform(phptrace_context_t *ctx, phptrace_file_record_t *r);
+sds dump_transform(phptrace_context_t *ctx, phptrace_file_record_t *r);
+sds json_transform(phptrace_context_t *ctx, phptrace_file_record_t *r);
+
 void phptrace_record_free(phptrace_file_record_t *r);
+int update_mmap_filename(phptrace_context_t *ctx);
+void trace_start(phptrace_context_t *ctx);
 void trace(phptrace_context_t *ctx);
 void trace_cleanup(phptrace_context_t *ctx);
+
+/* count utils */
+int wt_cmp(record_count_t *p, record_count_t *q);
+int avgwt_cmp(record_count_t *p, record_count_t *q);
+int ct_cmp(record_count_t *p, record_count_t *q);
+int calls_cmp(record_count_t *p, record_count_t *q);
+int name_cmp(record_count_t *p, record_count_t *q);
+int mem_cmp(record_count_t *p, record_count_t *q);
+int avgmem_cmp(record_count_t *p, record_count_t *q);
+
+void count_record(phptrace_context_t *ctx, phptrace_file_record_t *r);
+void count_summary(phptrace_context_t *ctx);
+int set_sortby(phptrace_context_t *ctx, char *sortby);
 
 /* stack related */
 int stack_dump_once(phptrace_context_t* ctx);
 int stack_dump(phptrace_context_t* ctx);
 void process_opt_s(phptrace_context_t *ctx);
-
-void init(phptrace_context_t *ctx, int argc, char *argv[]);
-void process(phptrace_context_t *ctx);
-
 #endif
